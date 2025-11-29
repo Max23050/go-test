@@ -32,6 +32,7 @@ type Order struct {
 	Status        string // "OPEN", "FILLED"
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
+	Timestamp     int64  // Time of submission (Created At) - NEW FIELD
 }
 
 type Trade struct {
@@ -55,23 +56,20 @@ var (
 // --- GalacticBuf Protocol Constants ---
 
 const (
-	// Versions
 	ProtoV1 = 0x01
 	ProtoV2 = 0x02
 
-	// Types
 	TypeInt    = 0x01
 	TypeString = 0x02
 	TypeList   = 0x03
 	TypeObject = 0x04
-	TypeBytes  = 0x05 // New in V2
+	TypeBytes  = 0x05
 )
 
 type GValue interface{}
 
 // --- Encoder (Always V2) ---
 
-// EncodeMessage теперь всегда создает сообщение версии V2
 func EncodeMessage(data map[string]GValue) ([]byte, error) {
 	bodyBuffer := new(bytes.Buffer)
 	if err := writeFieldsV2(bodyBuffer, data); err != nil {
@@ -80,12 +78,9 @@ func EncodeMessage(data map[string]GValue) ([]byte, error) {
 	bodyBytes := bodyBuffer.Bytes()
 
 	header := new(bytes.Buffer)
-	// Byte 0: Protocol Version (0x02)
 	header.WriteByte(ProtoV2)
-	// Byte 1: Field Count
 	header.WriteByte(byte(len(data)))
-	// Bytes 2-5: Total Message Length (4 bytes, BigEndian)
-	totalLen := 6 + len(bodyBytes) // Header in V2 is 6 bytes
+	totalLen := 6 + len(bodyBytes)
 	binary.Write(header, binary.BigEndian, uint32(totalLen))
 
 	return append(header.Bytes(), bodyBytes...), nil
@@ -108,18 +103,15 @@ func writeFieldsV2(buf *bytes.Buffer, data map[string]GValue) error {
 			binary.Write(buf, binary.BigEndian, int64(v))
 		case string:
 			buf.WriteByte(TypeString)
-			// V2 String Length is 4 bytes (uint32)
 			binary.Write(buf, binary.BigEndian, uint32(len(v)))
 			buf.WriteString(v)
 		case []byte:
-			// New Type: Bytes (0x05)
 			buf.WriteByte(TypeBytes)
 			binary.Write(buf, binary.BigEndian, uint32(len(v)))
 			buf.Write(v)
-		case []map[string]GValue: // List of Objects
+		case []map[string]GValue:
 			buf.WriteByte(TypeList)
 			buf.WriteByte(TypeObject)
-			// V2 List Count is 4 bytes (uint32)
 			binary.Write(buf, binary.BigEndian, uint32(len(v)))
 			for _, obj := range v {
 				buf.WriteByte(byte(len(obj)))
@@ -137,7 +129,6 @@ func writeFieldsV2(buf *bytes.Buffer, data map[string]GValue) error {
 // --- Decoder (Dispatcher V1/V2) ---
 
 func DecodeMessage(r io.Reader) (map[string]GValue, error) {
-	// Peek version byte
 	versionByte := make([]byte, 1)
 	if _, err := io.ReadFull(r, versionByte); err != nil {
 		if err == io.EOF {
@@ -155,22 +146,19 @@ func DecodeMessage(r io.Reader) (map[string]GValue, error) {
 	}
 }
 
-// --- V1 Decoding Logic (Legacy) ---
+// V1 Logic
 func decodeV1(r io.Reader) (map[string]GValue, error) {
-	// Read remaining 3 bytes of V1 Header (Count [1], Len [2])
 	headerRem := make([]byte, 3)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
 		return nil, err
 	}
 	fieldCount := int(headerRem[0])
-	// Total length ignored in stream parsing
 	return readFieldsV1(r, fieldCount)
 }
 
 func readFieldsV1(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
-		// Name
 		var nameLen uint8
 		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
 			return nil, err
@@ -181,13 +169,11 @@ func readFieldsV1(r io.Reader, count int) (map[string]GValue, error) {
 		}
 		fieldName := string(nameBytes)
 
-		// Type
 		var typeInd uint8
 		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
 			return nil, err
 		}
 
-		// Value (V1 Rules)
 		val, err := readValueV1(r, typeInd)
 		if err != nil {
 			return nil, err
@@ -206,7 +192,7 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 		}
 		return v, nil
 	case TypeString:
-		var l uint16 // V1 uses uint16
+		var l uint16
 		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
 			return nil, err
 		}
@@ -218,7 +204,7 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 	case TypeList:
 		var elemType uint8
 		binary.Read(r, binary.BigEndian, &elemType)
-		var count uint16 // V1 uses uint16
+		var count uint16
 		binary.Read(r, binary.BigEndian, &count)
 		list := make([]GValue, 0, count)
 		for k := 0; k < int(count); k++ {
@@ -242,9 +228,8 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 	}
 }
 
-// --- V2 Decoding Logic (New) ---
+// V2 Logic
 func decodeV2(r io.Reader) (map[string]GValue, error) {
-	// Read remaining 5 bytes of V2 Header (Count [1], Len [4])
 	headerRem := make([]byte, 5)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
 		return nil, err
@@ -256,7 +241,6 @@ func decodeV2(r io.Reader) (map[string]GValue, error) {
 func readFieldsV2(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
-		// Name (Same as V1)
 		var nameLen uint8
 		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
 			return nil, err
@@ -267,13 +251,11 @@ func readFieldsV2(r io.Reader, count int) (map[string]GValue, error) {
 		}
 		fieldName := string(nameBytes)
 
-		// Type
 		var typeInd uint8
 		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
 			return nil, err
 		}
 
-		// Value (V2 Rules)
 		val, err := readValueV2(r, typeInd)
 		if err != nil {
 			return nil, err
@@ -292,42 +274,39 @@ func readValueV2(r io.Reader, typeInd uint8) (GValue, error) {
 		}
 		return v, nil
 	case TypeString:
-		var l uint32 // V2 uses uint32
+		var l uint32
 		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
 			return nil, err
 		}
-		// Защита от OOM на хакатоне, если придет битая длина
-		if l > 100*1024*1024 { // 100MB limit sanity check
-			return nil, fmt.Errorf("string too large for sanity check")
+		if l > 100*1024*1024 {
+			return nil, fmt.Errorf("string too large")
 		}
 		buf := make([]byte, l)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
 		return string(buf), nil
-	case TypeBytes: // New in V2
+	case TypeBytes:
 		var l uint32
 		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
 			return nil, err
 		}
 		if l > 100*1024*1024 {
-			return nil, fmt.Errorf("bytes too large for sanity check")
+			return nil, fmt.Errorf("bytes too large")
 		}
 		buf := make([]byte, l)
 		if _, err := io.ReadFull(r, buf); err != nil {
 			return nil, err
 		}
-		return buf, nil // Return []byte
+		return buf, nil
 	case TypeList:
 		var elemType uint8
 		binary.Read(r, binary.BigEndian, &elemType)
-		var count uint32 // V2 uses uint32
+		var count uint32
 		binary.Read(r, binary.BigEndian, &count)
-		
-		if count > 100000 { // Sanity check
-			return nil, fmt.Errorf("list too large for sanity check")
+		if count > 100000 {
+			return nil, fmt.Errorf("list too large")
 		}
-
 		list := make([]GValue, 0, count)
 		for k := 0; k < int(count); k++ {
 			if elemType == TypeObject {
@@ -370,7 +349,7 @@ func getUserFromToken(r *http.Request) (string, bool) {
 	return user, ok
 }
 
-// --- HTTP Handlers (Unchanged logic, utilizing updated Decode/Encode) ---
+// --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
@@ -467,7 +446,7 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// V1 Orders
+// V1 Orders Handler (Updated with Timestamp)
 func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -562,6 +541,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 			Status:        "OPEN",
 			Side:          "sell",
 			Version:       1,
+			Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -574,7 +554,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// V2 Orders
+// V2 Orders Handler (Updated with Timestamp)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -632,11 +612,61 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		Status:        "OPEN",
 		Side:          side,
 		Version:       2,
+		Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
 	}
 	orders[orderID] = newOrder
 	mu.Unlock()
 
 	resp := map[string]GValue{"order_id": orderID}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
+// NEW HANDLER: GET /v2/my-orders
+func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	// 1. Auth Required
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	mu.RLock()
+	// 2. Filter User's Active Orders
+	var myOrders []*Order
+	for _, o := range orders {
+		if o.Owner == username && o.Status == "OPEN" {
+			myOrders = append(myOrders, o)
+		}
+	}
+	mu.RUnlock()
+
+	// 3. Sort by Timestamp Descending (Newest First)
+	sort.Slice(myOrders, func(i, j int) bool {
+		return myOrders[i].Timestamp > myOrders[j].Timestamp
+	})
+
+	// 4. Construct Response
+	list := make([]map[string]GValue, 0, len(myOrders))
+	for _, o := range myOrders {
+		list = append(list, map[string]GValue{
+			"order_id":       o.ID,
+			"side":           o.Side,
+			"price":          o.Price,
+			"quantity":       o.Quantity,
+			"delivery_start": o.DeliveryStart,
+			"delivery_end":   o.DeliveryEnd,
+			"timestamp":      o.Timestamp,
+		})
+	}
+
+	resp := map[string]GValue{"orders": list}
 	encoded, _ := EncodeMessage(resp)
 	w.Header().Set("Content-Type", "application/x-galacticbuf")
 	w.Write(encoded)
@@ -735,8 +765,11 @@ func main() {
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/user/password", passwordHandler)
+	
 	mux.HandleFunc("/orders", ordersV1Handler)
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
+	mux.HandleFunc("/v2/my-orders", myOrdersHandler) // NEW ROUTE
+	
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
