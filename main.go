@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"sort"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 )
@@ -29,10 +30,10 @@ type Order struct {
 	DeliveryStart int64
 	DeliveryEnd   int64
 	Owner         string // Username
-	Status        string // "OPEN", "FILLED"
+	Status        string // "OPEN", "FILLED", "CANCELLED"
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
-	Timestamp     int64  // Time of submission (Created At) - NEW FIELD
+	Timestamp     int64  // Time of submission (for priority)
 }
 
 type Trade struct {
@@ -146,7 +147,6 @@ func DecodeMessage(r io.Reader) (map[string]GValue, error) {
 	}
 }
 
-// V1 Logic
 func decodeV1(r io.Reader) (map[string]GValue, error) {
 	headerRem := make([]byte, 3)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
@@ -160,24 +160,15 @@ func readFieldsV1(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
 		var nameLen uint8
-		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &nameLen)
 		nameBytes := make([]byte, nameLen)
-		if _, err := io.ReadFull(r, nameBytes); err != nil {
-			return nil, err
-		}
+		io.ReadFull(r, nameBytes)
 		fieldName := string(nameBytes)
 
 		var typeInd uint8
-		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &typeInd)
 
-		val, err := readValueV1(r, typeInd)
-		if err != nil {
-			return nil, err
-		}
+		val, _ := readValueV1(r, typeInd)
 		result[fieldName] = val
 	}
 	return result, nil
@@ -187,19 +178,13 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 	switch typeInd {
 	case TypeInt:
 		var v int64
-		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &v)
 		return v, nil
 	case TypeString:
 		var l uint16
-		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &l)
 		buf := make([]byte, l)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
+		io.ReadFull(r, buf)
 		return string(buf), nil
 	case TypeList:
 		var elemType uint8
@@ -224,11 +209,10 @@ func readValueV1(r io.Reader, typeInd uint8) (GValue, error) {
 		binary.Read(r, binary.BigEndian, &fc)
 		return readFieldsV1(r, int(fc))
 	default:
-		return nil, fmt.Errorf("unknown type V1 %x", typeInd)
+		return nil, nil
 	}
 }
 
-// V2 Logic
 func decodeV2(r io.Reader) (map[string]GValue, error) {
 	headerRem := make([]byte, 5)
 	if _, err := io.ReadFull(r, headerRem); err != nil {
@@ -242,24 +226,15 @@ func readFieldsV2(r io.Reader, count int) (map[string]GValue, error) {
 	result := make(map[string]GValue)
 	for i := 0; i < count; i++ {
 		var nameLen uint8
-		if err := binary.Read(r, binary.BigEndian, &nameLen); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &nameLen)
 		nameBytes := make([]byte, nameLen)
-		if _, err := io.ReadFull(r, nameBytes); err != nil {
-			return nil, err
-		}
+		io.ReadFull(r, nameBytes)
 		fieldName := string(nameBytes)
 
 		var typeInd uint8
-		if err := binary.Read(r, binary.BigEndian, &typeInd); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &typeInd)
 
-		val, err := readValueV2(r, typeInd)
-		if err != nil {
-			return nil, err
-		}
+		val, _ := readValueV2(r, typeInd)
 		result[fieldName] = val
 	}
 	return result, nil
@@ -269,44 +244,28 @@ func readValueV2(r io.Reader, typeInd uint8) (GValue, error) {
 	switch typeInd {
 	case TypeInt:
 		var v int64
-		if err := binary.Read(r, binary.BigEndian, &v); err != nil {
-			return nil, err
-		}
+		binary.Read(r, binary.BigEndian, &v)
 		return v, nil
 	case TypeString:
 		var l uint32
-		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
-			return nil, err
-		}
-		if l > 100*1024*1024 {
-			return nil, fmt.Errorf("string too large")
-		}
+		binary.Read(r, binary.BigEndian, &l)
+		if l > 100*1024*1024 { return nil, fmt.Errorf("limit") }
 		buf := make([]byte, l)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
+		io.ReadFull(r, buf)
 		return string(buf), nil
 	case TypeBytes:
 		var l uint32
-		if err := binary.Read(r, binary.BigEndian, &l); err != nil {
-			return nil, err
-		}
-		if l > 100*1024*1024 {
-			return nil, fmt.Errorf("bytes too large")
-		}
+		binary.Read(r, binary.BigEndian, &l)
+		if l > 100*1024*1024 { return nil, fmt.Errorf("limit") }
 		buf := make([]byte, l)
-		if _, err := io.ReadFull(r, buf); err != nil {
-			return nil, err
-		}
+		io.ReadFull(r, buf)
 		return buf, nil
 	case TypeList:
 		var elemType uint8
 		binary.Read(r, binary.BigEndian, &elemType)
 		var count uint32
 		binary.Read(r, binary.BigEndian, &count)
-		if count > 100000 {
-			return nil, fmt.Errorf("list too large")
-		}
+		if count > 100000 { return nil, fmt.Errorf("limit") }
 		list := make([]GValue, 0, count)
 		for k := 0; k < int(count); k++ {
 			if elemType == TypeObject {
@@ -325,7 +284,7 @@ func readValueV2(r io.Reader, typeInd uint8) (GValue, error) {
 		binary.Read(r, binary.BigEndian, &fc)
 		return readFieldsV2(r, int(fc))
 	default:
-		return nil, fmt.Errorf("unknown type V2 %x", typeInd)
+		return nil, nil
 	}
 }
 
@@ -446,7 +405,7 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// V1 Orders Handler (Updated with Timestamp)
+// V1 Orders Handler
 func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -541,7 +500,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 			Status:        "OPEN",
 			Side:          "sell",
 			Version:       1,
-			Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
+			Timestamp:     time.Now().UnixMilli(),
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -554,7 +513,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// V2 Orders Handler (Updated with Timestamp)
+// V2 Orders Handler (Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -612,10 +571,12 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		Status:        "OPEN",
 		Side:          side,
 		Version:       2,
-		Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
+		Timestamp:     time.Now().UnixMilli(),
 	}
 	orders[orderID] = newOrder
 	mu.Unlock()
+
+	// FUTURE: Trigger Matching Engine Here
 
 	resp := map[string]GValue{"order_id": orderID}
 	encoded, _ := EncodeMessage(resp)
@@ -623,14 +584,120 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 	w.Write(encoded)
 }
 
-// NEW HANDLER: GET /v2/my-orders
+// NEW HANDLER: V2 Modify / Cancel (PUT/DELETE /v2/orders/{id})
+func ordersV2ByIDHandler(w http.ResponseWriter, r *http.Request) {
+	// Extract ID from path: /v2/orders/{id}
+	// Note: We registered "/v2/orders/" so trimming prefix works
+	orderID := strings.TrimPrefix(r.URL.Path, "/v2/orders/")
+	if orderID == "" {
+		http.Error(w, "Missing Order ID", http.StatusNotFound)
+		return
+	}
+
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	// --- MODIFY ORDER (PUT) ---
+	if r.Method == http.MethodPut {
+		data, err := DecodeMessage(r.Body)
+		if err != nil {
+			http.Error(w, "Bad Request", http.StatusBadRequest)
+			return
+		}
+
+		newPrice, ok1 := data["price"].(int64)
+		newQuantity, ok2 := data["quantity"].(int64)
+
+		if !ok1 || !ok2 {
+			http.Error(w, "Missing price or quantity", http.StatusBadRequest)
+			return
+		}
+		if newQuantity <= 0 {
+			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		order, exists := orders[orderID]
+		if !exists || order.Status == "CANCELLED" {
+			http.Error(w, "Order not found", http.StatusNotFound)
+			return
+		}
+		// V2 check
+		if order.Version != 2 {
+			http.Error(w, "Order not found", http.StatusNotFound)
+			return
+		}
+		// Ownership check
+		if order.Owner != username {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		// Status check
+		if order.Status != "OPEN" {
+			http.Error(w, "Order not active", http.StatusNotFound)
+			return
+		}
+
+		// --- Time Priority Logic ---
+		// 1. Price change resets priority
+		// 2. Quantity increase resets priority
+		// 3. Quantity decrease preserves priority
+		if newPrice != order.Price || newQuantity > order.Quantity {
+			order.Timestamp = time.Now().UnixMilli()
+		}
+		
+		order.Price = newPrice
+		order.Quantity = newQuantity
+		
+		// FUTURE: Trigger Matching Engine Here
+
+		w.WriteHeader(http.StatusOK)
+		return
+	}
+
+	// --- CANCEL ORDER (DELETE) ---
+	if r.Method == http.MethodDelete {
+		mu.Lock()
+		defer mu.Unlock()
+
+		order, exists := orders[orderID]
+		if !exists || order.Status == "CANCELLED" {
+			http.Error(w, "Order not found", http.StatusNotFound)
+			return
+		}
+		if order.Version != 2 {
+			http.Error(w, "Order not found", http.StatusNotFound)
+			return
+		}
+		if order.Owner != username {
+			http.Error(w, "Forbidden", http.StatusForbidden)
+			return
+		}
+		if order.Status != "OPEN" {
+			http.Error(w, "Order not active", http.StatusNotFound) // Requirement says 404 if fully filled
+			return
+		}
+
+		order.Status = "CANCELLED"
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
 func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// 1. Auth Required
 	username, authOk := getUserFromToken(r)
 	if !authOk {
 		http.Error(w, "Unauthorized", http.StatusUnauthorized)
@@ -638,21 +705,19 @@ func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	mu.RLock()
-	// 2. Filter User's Active Orders
 	var myOrders []*Order
 	for _, o := range orders {
+		// Only show active orders (CANCELLED are hidden)
 		if o.Owner == username && o.Status == "OPEN" {
 			myOrders = append(myOrders, o)
 		}
 	}
 	mu.RUnlock()
 
-	// 3. Sort by Timestamp Descending (Newest First)
 	sort.Slice(myOrders, func(i, j int) bool {
 		return myOrders[i].Timestamp > myOrders[j].Timestamp
 	})
 
-	// 4. Construct Response
 	list := make([]map[string]GValue, 0, len(myOrders))
 	for _, o := range myOrders {
 		list = append(list, map[string]GValue{
@@ -767,9 +832,10 @@ func main() {
 	mux.HandleFunc("/user/password", passwordHandler)
 	
 	mux.HandleFunc("/orders", ordersV1Handler)
-	mux.HandleFunc("/v2/orders", ordersV2Handler)
-	mux.HandleFunc("/v2/my-orders", myOrdersHandler) // NEW ROUTE
+	mux.HandleFunc("/v2/orders", ordersV2Handler) // Creates Order
+	mux.HandleFunc("/v2/orders/", ordersV2ByIDHandler) // Modify/Cancel (Requires ID)
 	
+	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
