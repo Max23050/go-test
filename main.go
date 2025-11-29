@@ -32,7 +32,7 @@ type Order struct {
 	Status        string // "OPEN", "FILLED"
 	Side          string // "buy" or "sell"
 	Version       int    // 1 or 2
-	Timestamp     int64  // Time of submission (Created At)
+	Timestamp     int64  // Time of submission (Created At) - NEW FIELD
 }
 
 type Trade struct {
@@ -446,7 +446,7 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
-// V1 Orders Handler (V1 List & V1 Submit)
+// V1 Orders Handler (Updated with Timestamp)
 func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -541,7 +541,7 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 			Status:        "OPEN",
 			Side:          "sell",
 			Version:       1,
-			Timestamp:     time.Now().UnixMilli(),
+			Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
 		}
 		orders[orderID] = newOrder
 		mu.Unlock()
@@ -554,159 +554,76 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// V2 Orders Handler (V2 Order Book & V2 Submit)
+// V2 Orders Handler (Updated with Timestamp)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
-	
-	// GET /v2/orders (ORDER BOOK - Public)
-	if r.Method == http.MethodGet {
-		q := r.URL.Query()
-		startStr := q.Get("delivery_start")
-		endStr := q.Get("delivery_end")
-
-		if startStr == "" || endStr == "" {
-			http.Error(w, "Missing query params", http.StatusBadRequest)
-			return
-		}
-
-		start, err1 := strconv.ParseInt(startStr, 10, 64)
-		end, err2 := strconv.ParseInt(endStr, 10, 64)
-		if err1 != nil || err2 != nil {
-			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
-			return
-		}
-		
-		mu.RLock()
-		var bids []*Order
-		var asks []*Order
-		
-		for _, o := range orders {
-			// Filters: V2, OPEN, Match Contract
-			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
-				if o.Side == "buy" {
-					bids = append(bids, o)
-				} else if o.Side == "sell" {
-					asks = append(asks, o)
-				}
-			}
-		}
-		mu.RUnlock()
-
-		// --- Sorting ---
-		
-		// Bids: Price DESC (Highest First), then Time ASC (Oldest First)
-		sort.Slice(bids, func(i, j int) bool {
-			if bids[i].Price != bids[j].Price {
-				return bids[i].Price > bids[j].Price // Highest price first
-			}
-			return bids[i].Timestamp < bids[j].Timestamp // Oldest time first
-		})
-		
-		// Asks: Price ASC (Lowest First), then Time ASC (Oldest First)
-		sort.Slice(asks, func(i, j int) bool {
-			if asks[i].Price != asks[j].Price {
-				return asks[i].Price < asks[j].Price // Lowest price first
-			}
-			return asks[i].Timestamp < asks[j].Timestamp // Oldest time first
-		})
-
-		// --- Response Construction ---
-		
-		bidsList := make([]map[string]GValue, 0, len(bids))
-		for _, o := range bids {
-			bidsList = append(bidsList, map[string]GValue{
-				"order_id": o.ID,
-				"price":    o.Price,
-				"quantity": o.Quantity,
-			})
-		}
-
-		asksList := make([]map[string]GValue, 0, len(asks))
-		for _, o := range asks {
-			asksList = append(asksList, map[string]GValue{
-				"order_id": o.ID,
-				"price":    o.Price,
-				"quantity": o.Quantity,
-			})
-		}
-		
-		resp := map[string]GValue{
-			"bids": bidsList,
-			"asks": asksList,
-		}
-		encoded, _ := EncodeMessage(resp)
-		w.Header().Set("Content-Type", "application/x-galacticbuf")
-		w.Write(encoded)
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 		return
 	}
 
-	// POST /v2/orders (Submit V2 - Auth Required)
-	if r.Method == http.MethodPost {
-		username, authOk := getUserFromToken(r)
-		if !authOk {
-			http.Error(w, "Unauthorized", http.StatusUnauthorized)
-			return
-		}
-
-		data, err := DecodeMessage(r.Body)
-		if err != nil {
-			http.Error(w, "Bad Request", http.StatusBadRequest)
-			return
-		}
-
-		side, ok0 := data["side"].(string)
-		price, ok1 := data["price"].(int64)
-		quantity, ok2 := data["quantity"].(int64)
-		start, ok3 := data["delivery_start"].(int64)
-		end, ok4 := data["delivery_end"].(int64)
-
-		if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
-			http.Error(w, "Missing fields", http.StatusBadRequest)
-			return
-		}
-
-		if side != "buy" && side != "sell" {
-			http.Error(w, "Invalid side", http.StatusBadRequest)
-			return
-		}
-
-		if quantity <= 0 {
-			http.Error(w, "Quantity must be positive", http.StatusBadRequest)
-			return
-		}
-		const hourMs = 3600000
-		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
-			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
-			return
-		}
-
-		mu.Lock()
-		orderCounter++
-		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
-		newOrder := &Order{
-			ID:            orderID,
-			Price:         price,
-			Quantity:      quantity,
-			DeliveryStart: start,
-			DeliveryEnd:   end,
-			Owner:         username,
-			Status:        "OPEN",
-			Side:          side,
-			Version:       2,
-			Timestamp:     time.Now().UnixMilli(),
-		}
-		orders[orderID] = newOrder
-		mu.Unlock()
-
-		resp := map[string]GValue{"order_id": orderID}
-		encoded, _ := EncodeMessage(resp)
-		w.Header().Set("Content-Type", "application/x-galacticbuf")
-		w.Write(encoded)
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
 		return
 	}
-	
-	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	side, ok0 := data["side"].(string)
+	price, ok1 := data["price"].(int64)
+	quantity, ok2 := data["quantity"].(int64)
+	start, ok3 := data["delivery_start"].(int64)
+	end, ok4 := data["delivery_end"].(int64)
+
+	if !ok0 || !ok1 || !ok2 || !ok3 || !ok4 {
+		http.Error(w, "Missing fields", http.StatusBadRequest)
+		return
+	}
+
+	if side != "buy" && side != "sell" {
+		http.Error(w, "Invalid side", http.StatusBadRequest)
+		return
+	}
+
+	if quantity <= 0 {
+		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+		return
+	}
+	const hourMs = 3600000
+	if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+		http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	orderCounter++
+	orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
+	newOrder := &Order{
+		ID:            orderID,
+		Price:         price,
+		Quantity:      quantity,
+		DeliveryStart: start,
+		DeliveryEnd:   end,
+		Owner:         username,
+		Status:        "OPEN",
+		Side:          side,
+		Version:       2,
+		Timestamp:     time.Now().UnixMilli(), // POPULATING TIMESTAMP
+	}
+	orders[orderID] = newOrder
+	mu.Unlock()
+
+	resp := map[string]GValue{"order_id": orderID}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
 }
 
+// NEW HANDLER: GET /v2/my-orders
 func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
@@ -807,7 +724,6 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		defer mu.Unlock()
 
 		order, exists := orders[orderID]
-		// V1 endpoint only takes V1 orders
 		if !exists || order.Status != "OPEN" || order.Version != 1 {
 			http.Error(w, "Order not found or inactive", http.StatusNotFound)
 			return
@@ -852,7 +768,7 @@ func main() {
 	
 	mux.HandleFunc("/orders", ordersV1Handler)
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
-	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
+	mux.HandleFunc("/v2/my-orders", myOrdersHandler) // NEW ROUTE
 	
 	mux.HandleFunc("/trades", tradesHandler)
 
