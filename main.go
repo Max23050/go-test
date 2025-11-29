@@ -46,10 +46,11 @@ type Trade struct {
 
 var (
 	mu           sync.RWMutex
-	users        = make(map[string]User)
-	tokens       = make(map[string]string)
-	orders       = make(map[string]*Order)
-	trades       = make([]*Trade, 0)
+	users              = make(map[string]User)
+	tokens             = make(map[string]string)
+	dnaSamples         = make(map[string][]string)
+	orders             = make(map[string]*Order)
+	trades             = make([]*Trade, 0)
 	orderCounter int64 = 0
 )
 
@@ -349,6 +350,126 @@ func getUserFromToken(r *http.Request) (string, bool) {
 	return user, ok
 }
 
+func validateDNASample(s string) bool {
+	if s == "" || len(s)%3 != 0 {
+		return false
+	}
+	for i := 0; i < len(s); i++ {
+		switch s[i] {
+		case 'C', 'G', 'A', 'T':
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+func splitCodons(s string) []string {
+	codons := make([]string, 0, len(s)/3)
+	for i := 0; i < len(s); i += 3 {
+		codons = append(codons, s[i:i+3])
+	}
+	return codons
+}
+
+func absInt(v int) int {
+	if v < 0 {
+		return -v
+	}
+	return v
+}
+
+func codonEditDistanceBounded(a, b []string, limit int) int {
+	m := len(a)
+	n := len(b)
+	if limit < 0 {
+		limit = 0
+	}
+	if absInt(m-n) > limit {
+		return limit + 1
+	}
+	if limit == 0 {
+		if m != n {
+			return limit + 1
+		}
+		for i := range a {
+			if a[i] != b[i] {
+				return limit + 1
+			}
+		}
+		return 0
+	}
+
+	inf := limit + 1
+	prev := make(map[int]int, 2*limit+2)
+	for j := 0; j <= n && j <= limit; j++ {
+		prev[j] = j
+	}
+
+	for i := 1; i <= m; i++ {
+		curr := make(map[int]int, 2*limit+2)
+		startJ := i - limit
+		if startJ < 0 {
+			startJ = 0
+		}
+		endJ := i + limit
+		if endJ > n {
+			endJ = n
+		}
+
+		for j := startJ; j <= endJ; j++ {
+			del := inf
+			if v, ok := prev[j]; ok {
+				del = v + 1
+			}
+			ins := inf
+			if v, ok := curr[j-1]; ok {
+				ins = v + 1
+			}
+			sub := inf
+			if j > 0 {
+				if v, ok := prev[j-1]; ok {
+					sub = v
+					if a[i-1] != b[j-1] {
+						sub++
+					}
+				}
+			}
+
+			val := del
+			if ins < val {
+				val = ins
+			}
+			if sub < val {
+				val = sub
+			}
+			if val <= limit {
+				curr[j] = val
+			}
+		}
+
+		if len(curr) == 0 {
+			return limit + 1
+		}
+
+		minRow := inf
+		for _, v := range curr {
+			if v < minRow {
+				minRow = v
+			}
+		}
+		if minRow > limit {
+			return limit + 1
+		}
+		prev = curr
+	}
+
+	if v, ok := prev[n]; ok && v <= limit {
+		return v
+	}
+	return limit + 1
+}
+
 // --- HTTP Handlers ---
 
 func healthHandler(w http.ResponseWriter, r *http.Request) {
@@ -444,6 +565,113 @@ func passwordHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	w.WriteHeader(http.StatusNoContent)
+}
+
+func dnaSubmitHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, okU := data["username"].(string)
+	password, okP := data["password"].(string)
+	dna, okD := data["dna_sample"].(string)
+	if !okU || !okP || !okD || username == "" || password == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if !validateDNASample(dna) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	u, exists := users[username]
+	if !exists || u.Password != password {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	existing := dnaSamples[username]
+	for _, sample := range existing {
+		if sample == dna {
+			w.WriteHeader(http.StatusNoContent)
+			return
+		}
+	}
+
+	dnaSamples[username] = append(existing, dna)
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func dnaLoginHandler(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	username, okU := data["username"].(string)
+	dna, okD := data["dna_sample"].(string)
+	if !okU || !okD || username == "" || dna == "" {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+	if !validateDNASample(dna) {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	submittedCodons := splitCodons(dna)
+
+	mu.RLock()
+	_, userExists := users[username]
+	samples := dnaSamples[username]
+	mu.RUnlock()
+
+	if !userExists || len(samples) == 0 {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	matched := false
+	for _, ref := range samples {
+		refCodons := splitCodons(ref)
+		allowed := len(refCodons) / 100000
+		dist := codonEditDistanceBounded(refCodons, submittedCodons, allowed)
+		if dist <= allowed {
+			matched = true
+			break
+		}
+	}
+
+	if !matched {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	token := generateToken()
+	mu.Lock()
+	tokens[token] = username
+	mu.Unlock()
+
+	resp := map[string]GValue{"token": token}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
 }
 
 // V1 Orders Handler (V1 List & V1 Submit)
@@ -553,10 +781,95 @@ func ordersV1Handler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 }
+// Helper to match order against the book
+// Assumes mu is locked
+func matchOrder(order *Order) int64 {
+	var filledQty int64 = 0
+	var matchingOrders []*Order
+
+	// Find matching orders
+	for _, o := range orders {
+		if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == order.DeliveryStart && o.DeliveryEnd == order.DeliveryEnd {
+			if order.Side == "buy" && o.Side == "sell" && order.Price >= o.Price {
+				matchingOrders = append(matchingOrders, o)
+			} else if order.Side == "sell" && o.Side == "buy" && order.Price <= o.Price {
+				matchingOrders = append(matchingOrders, o)
+			}
+		}
+	}
+
+	// Sort matching orders
+	if order.Side == "buy" {
+		sort.Slice(matchingOrders, func(i, j int) bool {
+			if matchingOrders[i].Price != matchingOrders[j].Price {
+				return matchingOrders[i].Price < matchingOrders[j].Price
+			}
+			return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp
+		})
+	} else {
+		sort.Slice(matchingOrders, func(i, j int) bool {
+			if matchingOrders[i].Price != matchingOrders[j].Price {
+				return matchingOrders[i].Price > matchingOrders[j].Price
+			}
+			return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp
+		})
+	}
+
+	now := time.Now().UnixMilli()
+
+	// Execute matches
+	for _, matchOrder := range matchingOrders {
+		if order.Quantity <= 0 {
+			break
+		}
+
+		tradeQty := order.Quantity
+		if matchOrder.Quantity < tradeQty {
+			tradeQty = matchOrder.Quantity
+		}
+
+		tradePrice := matchOrder.Price
+
+		var buyerID, sellerID string
+		if order.Side == "buy" {
+			buyerID = order.Owner
+			sellerID = matchOrder.Owner
+		} else {
+			buyerID = matchOrder.Owner
+			sellerID = order.Owner
+		}
+
+		tradeID := fmt.Sprintf("trd-%s-%d", matchOrder.ID, now)
+		newTrade := &Trade{
+			ID:        tradeID,
+			BuyerID:   buyerID,
+			SellerID:  sellerID,
+			Price:     tradePrice,
+			Quantity:  tradeQty,
+			Timestamp: now,
+		}
+		trades = append(trades, newTrade)
+
+		order.Quantity -= tradeQty
+		filledQty += tradeQty
+		matchOrder.Quantity -= tradeQty
+
+		if matchOrder.Quantity <= 0 {
+			matchOrder.Status = "FILLED"
+		}
+	}
+
+	if order.Quantity <= 0 {
+		order.Status = "FILLED"
+	}
+
+	return filledQty
+}
+
 
 // V2 Orders Handler (V2 Order Book & V2 Submit)
 func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
-	
+
 	// GET /v2/orders (ORDER BOOK - Public)
 	if r.Method == http.MethodGet {
 		q := r.URL.Query()
@@ -574,11 +887,16 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			http.Error(w, "Invalid timestamps", http.StatusBadRequest)
 			return
 		}
-		
+		const hourMs = 3600000
+		if start%hourMs != 0 || end%hourMs != 0 || end <= start || (end-start) != hourMs {
+			http.Error(w, "Invalid Contract Timestamps", http.StatusBadRequest)
+			return
+		}
+
 		mu.RLock()
 		var bids []*Order
 		var asks []*Order
-		
+
 		for _, o := range orders {
 			// Filters: V2, OPEN, Match Contract
 			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
@@ -592,7 +910,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		mu.RUnlock()
 
 		// --- Sorting ---
-		
+
 		// Bids: Price DESC (Highest First), then Time ASC (Oldest First)
 		sort.Slice(bids, func(i, j int) bool {
 			if bids[i].Price != bids[j].Price {
@@ -600,7 +918,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 			}
 			return bids[i].Timestamp < bids[j].Timestamp // Oldest time first
 		})
-		
+
 		// Asks: Price ASC (Lowest First), then Time ASC (Oldest First)
 		sort.Slice(asks, func(i, j int) bool {
 			if asks[i].Price != asks[j].Price {
@@ -610,7 +928,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		})
 
 		// --- Response Construction ---
-		
+
 		bidsList := make([]map[string]GValue, 0, len(bids))
 		for _, o := range bids {
 			bidsList = append(bidsList, map[string]GValue{
@@ -628,7 +946,7 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 				"quantity": o.Quantity,
 			})
 		}
-		
+
 		resp := map[string]GValue{
 			"bids": bidsList,
 			"asks": asksList,
@@ -683,115 +1001,29 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		orderCounter++
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
 		now := time.Now().UnixMilli()
-		
-		// Track filled quantity for the incoming order
-		remainingQty := quantity
-		var filledQty int64 = 0
 
-		// Find matching orders from the opposite side
-		var matchingOrders []*Order
-		for _, o := range orders {
-			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
-				if side == "buy" && o.Side == "sell" && price >= o.Price {
-					// Buy order matches sell orders where buy_price >= sell_price
-					matchingOrders = append(matchingOrders, o)
-				} else if side == "sell" && o.Side == "buy" && price <= o.Price {
-					// Sell order matches buy orders where sell_price <= buy_price
-					matchingOrders = append(matchingOrders, o)
-				}
-			}
+		newOrder := &Order{
+			ID:            orderID,
+			Price:         price,
+			Quantity:      quantity,
+			DeliveryStart: start,
+			DeliveryEnd:   end,
+			Owner:         username,
+			Status:        "OPEN",
+			Side:          side,
+			Version:       2,
+			Timestamp:     now,
 		}
 
-		// Sort matching orders by price-time priority
-		if side == "buy" {
-			// For incoming buy: match cheapest sells first, then oldest first
-			sort.Slice(matchingOrders, func(i, j int) bool {
-				if matchingOrders[i].Price != matchingOrders[j].Price {
-					return matchingOrders[i].Price < matchingOrders[j].Price // Lowest price first
-				}
-				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
-			})
-		} else {
-			// For incoming sell: match highest bids first, then oldest first
-			sort.Slice(matchingOrders, func(i, j int) bool {
-				if matchingOrders[i].Price != matchingOrders[j].Price {
-					return matchingOrders[i].Price > matchingOrders[j].Price // Highest price first
-				}
-				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
-			})
-		}
-
-		// Execute matches
-		for _, matchOrder := range matchingOrders {
-			if remainingQty <= 0 {
-				break
-			}
-
-			// Determine trade quantity
-			tradeQty := remainingQty
-			if matchOrder.Quantity < tradeQty {
-				tradeQty = matchOrder.Quantity
-			}
-
-			// Determine trade price (resting/maker order's price)
-			tradePrice := matchOrder.Price
-
-			// Determine buyer and seller
-			var buyerID, sellerID string
-			if side == "buy" {
-				buyerID = username
-				sellerID = matchOrder.Owner
-			} else {
-				buyerID = matchOrder.Owner
-				sellerID = username
-			}
-
-			// Create trade record
-			tradeID := fmt.Sprintf("trd-%s-%d", matchOrder.ID, now)
-			newTrade := &Trade{
-				ID:        tradeID,
-				BuyerID:   buyerID,
-				SellerID:  sellerID,
-				Price:     tradePrice,
-				Quantity:  tradeQty,
-				Timestamp: now,
-			}
-			trades = append(trades, newTrade)
-
-			// Update quantities
-			remainingQty -= tradeQty
-			filledQty += tradeQty
-			matchOrder.Quantity -= tradeQty
-
-			// Update matching order status
-			if matchOrder.Quantity <= 0 {
-				matchOrder.Status = "FILLED"
-			}
-		}
-
-		// Determine final status for incoming order
-		status := "ACTIVE"
-		if remainingQty <= 0 {
-			status = "FILLED"
-		}
+		filledQty := matchOrder(newOrder)
 
 		// Only insert into order book if not fully filled
-		if remainingQty > 0 {
-			newOrder := &Order{
-				ID:            orderID,
-				Price:         price,
-				Quantity:      remainingQty,
-				DeliveryStart: start,
-				DeliveryEnd:   end,
-				Owner:         username,
-				Status:        "OPEN",
-				Side:          side,
-				Version:       2,
-				Timestamp:     now,
-			}
+		if newOrder.Status != "FILLED" {
 			orders[orderID] = newOrder
 		}
 		mu.Unlock()
+
+		status := newOrder.Status
 
 		resp := map[string]GValue{
 			"order_id":        orderID,
@@ -803,8 +1035,134 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		w.Write(encoded)
 		return
 	}
-	
+
 	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+func orderOperationHandler(w http.ResponseWriter, r *http.Request) {
+	id := r.URL.Path[len("/v2/orders/"):]
+	if id == "" {
+		ordersV2Handler(w, r)
+		return
+	}
+
+	if r.Method == http.MethodPut {
+		modifyOrderHandler(w, r, id)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		cancelOrderHandler(w, r, id)
+		return
+	}
+	http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+}
+
+func modifyOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) {
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	data, err := DecodeMessage(r.Body)
+	if err != nil {
+		http.Error(w, "Bad Request", http.StatusBadRequest)
+		return
+	}
+
+	price, ok1 := data["price"].(int64)
+	quantity, ok2 := data["quantity"].(int64)
+	if !ok1 || !ok2 {
+		http.Error(w, "Missing fields", http.StatusBadRequest)
+		return
+	}
+	if quantity <= 0 {
+		http.Error(w, "Quantity must be positive", http.StatusBadRequest)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[orderID]
+	if !exists || order.Status == "CANCELLED" {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+	if order.Status == "FILLED" {
+		http.Error(w, "Order is fully filled", http.StatusNotFound)
+		return
+	}
+	if order.Owner != username {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if order.Version != 2 {
+		http.Error(w, "Order not found", http.StatusNotFound) // Only V2 orders
+		return
+	}
+
+	// Update Logic
+	resetPriority := false
+	if price != order.Price {
+		resetPriority = true
+	}
+	if quantity > order.Quantity {
+		resetPriority = true
+	}
+
+	order.Price = price
+	order.Quantity = quantity
+	if resetPriority {
+		now := time.Now().UnixMilli()
+		if now <= order.Timestamp {
+			now = order.Timestamp + 1
+		}
+		order.Timestamp = now
+	}
+
+	filledQty := matchOrder(order)
+
+	resp := map[string]GValue{
+		"order_id":        orderID,
+		"status":          order.Status,
+		"filled_quantity": filledQty,
+	}
+	encoded, _ := EncodeMessage(resp)
+	w.Header().Set("Content-Type", "application/x-galacticbuf")
+	w.Write(encoded)
+}
+
+func cancelOrderHandler(w http.ResponseWriter, r *http.Request, orderID string) {
+	username, authOk := getUserFromToken(r)
+	if !authOk {
+		http.Error(w, "Unauthorized", http.StatusUnauthorized)
+		return
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+
+	order, exists := orders[orderID]
+	if !exists || order.Status == "CANCELLED" {
+		http.Error(w, "Order not found", http.StatusNotFound)
+		return
+	}
+	if order.Status == "FILLED" {
+		http.Error(w, "Order is fully filled", http.StatusNotFound)
+		return
+	}
+	if order.Owner != username {
+		http.Error(w, "Forbidden", http.StatusForbidden)
+		return
+	}
+	if order.Version != 2 {
+		http.Error(w, "Order not found", http.StatusNotFound) // Only V2 orders
+		return
+	}
+
+	order.Status = "CANCELLED"
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func myOrdersHandler(w http.ResponseWriter, r *http.Request) {
@@ -914,10 +1272,10 @@ func tradesHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		order.Status = "FILLED"
-		
+
 		now := time.Now().UnixMilli()
 		tradeID := fmt.Sprintf("trd-%s-%d", order.ID, now)
-		
+
 		newTrade := &Trade{
 			ID:        tradeID,
 			BuyerID:   buyerUser,
@@ -944,16 +1302,19 @@ func loggingMiddleware(next http.HandlerFunc) http.HandlerFunc {
 
 func main() {
 	mux := http.NewServeMux()
-	
+
 	mux.HandleFunc("/health", healthHandler)
 	mux.HandleFunc("/register", registerHandler)
 	mux.HandleFunc("/login", loginHandler)
 	mux.HandleFunc("/user/password", passwordHandler)
-	
+	mux.HandleFunc("/dna-submit", dnaSubmitHandler)
+	mux.HandleFunc("/dna-login", dnaLoginHandler)
+
 	mux.HandleFunc("/orders", ordersV1Handler)
 	mux.HandleFunc("/v2/orders", ordersV2Handler)
+	mux.HandleFunc("/v2/orders/", orderOperationHandler)
 	mux.HandleFunc("/v2/my-orders", myOrdersHandler)
-	
+
 	mux.HandleFunc("/trades", tradesHandler)
 
 	log.Println("Galactic Exchange started on :8080")
