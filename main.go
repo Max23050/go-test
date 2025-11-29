@@ -682,22 +682,122 @@ func ordersV2Handler(w http.ResponseWriter, r *http.Request) {
 		mu.Lock()
 		orderCounter++
 		orderID := fmt.Sprintf("ord-v2-%d", orderCounter)
-		newOrder := &Order{
-			ID:            orderID,
-			Price:         price,
-			Quantity:      quantity,
-			DeliveryStart: start,
-			DeliveryEnd:   end,
-			Owner:         username,
-			Status:        "OPEN",
-			Side:          side,
-			Version:       2,
-			Timestamp:     time.Now().UnixMilli(),
+		now := time.Now().UnixMilli()
+		
+		// Track filled quantity for the incoming order
+		remainingQty := quantity
+		var filledQty int64 = 0
+
+		// Find matching orders from the opposite side
+		var matchingOrders []*Order
+		for _, o := range orders {
+			if o.Version == 2 && o.Status == "OPEN" && o.DeliveryStart == start && o.DeliveryEnd == end {
+				if side == "buy" && o.Side == "sell" && price >= o.Price {
+					// Buy order matches sell orders where buy_price >= sell_price
+					matchingOrders = append(matchingOrders, o)
+				} else if side == "sell" && o.Side == "buy" && price <= o.Price {
+					// Sell order matches buy orders where sell_price <= buy_price
+					matchingOrders = append(matchingOrders, o)
+				}
+			}
 		}
-		orders[orderID] = newOrder
+
+		// Sort matching orders by price-time priority
+		if side == "buy" {
+			// For incoming buy: match cheapest sells first, then oldest first
+			sort.Slice(matchingOrders, func(i, j int) bool {
+				if matchingOrders[i].Price != matchingOrders[j].Price {
+					return matchingOrders[i].Price < matchingOrders[j].Price // Lowest price first
+				}
+				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
+			})
+		} else {
+			// For incoming sell: match highest bids first, then oldest first
+			sort.Slice(matchingOrders, func(i, j int) bool {
+				if matchingOrders[i].Price != matchingOrders[j].Price {
+					return matchingOrders[i].Price > matchingOrders[j].Price // Highest price first
+				}
+				return matchingOrders[i].Timestamp < matchingOrders[j].Timestamp // Oldest first
+			})
+		}
+
+		// Execute matches
+		for _, matchOrder := range matchingOrders {
+			if remainingQty <= 0 {
+				break
+			}
+
+			// Determine trade quantity
+			tradeQty := remainingQty
+			if matchOrder.Quantity < tradeQty {
+				tradeQty = matchOrder.Quantity
+			}
+
+			// Determine trade price (resting/maker order's price)
+			tradePrice := matchOrder.Price
+
+			// Determine buyer and seller
+			var buyerID, sellerID string
+			if side == "buy" {
+				buyerID = username
+				sellerID = matchOrder.Owner
+			} else {
+				buyerID = matchOrder.Owner
+				sellerID = username
+			}
+
+			// Create trade record
+			tradeID := fmt.Sprintf("trd-%s-%d", matchOrder.ID, now)
+			newTrade := &Trade{
+				ID:        tradeID,
+				BuyerID:   buyerID,
+				SellerID:  sellerID,
+				Price:     tradePrice,
+				Quantity:  tradeQty,
+				Timestamp: now,
+			}
+			trades = append(trades, newTrade)
+
+			// Update quantities
+			remainingQty -= tradeQty
+			filledQty += tradeQty
+			matchOrder.Quantity -= tradeQty
+
+			// Update matching order status
+			if matchOrder.Quantity <= 0 {
+				matchOrder.Status = "FILLED"
+			}
+		}
+
+		// Determine final status for incoming order
+		status := "ACTIVE"
+		if remainingQty <= 0 {
+			status = "FILLED"
+		}
+
+		// Only insert into order book if not fully filled
+		if remainingQty > 0 {
+			newOrder := &Order{
+				ID:            orderID,
+				Price:         price,
+				Quantity:      remainingQty,
+				DeliveryStart: start,
+				DeliveryEnd:   end,
+				Owner:         username,
+				Status:        "OPEN",
+				Side:          side,
+				Version:       2,
+				Timestamp:     now,
+			}
+			orders[orderID] = newOrder
+		}
 		mu.Unlock()
 
-		resp := map[string]GValue{"order_id": orderID}
+		resp := map[string]GValue{
+			"order_id":        orderID,
+			"status":          status,
+			"filled_quantity": filledQty,
+		}
 		encoded, _ := EncodeMessage(resp)
 		w.Header().Set("Content-Type", "application/x-galacticbuf")
 		w.Write(encoded)
